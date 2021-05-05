@@ -8,7 +8,7 @@ from __future__ import print_function, absolute_import, division
 import logging
 
 from collections import defaultdict
-from errno import ENOENT, ENOMEM, ENOSYS, ENOTEMPTY
+from errno import ENOENT, ENOSPC, ENOSYS, ENOTEMPTY
 from stat import S_IFDIR, S_IFREG, S_ISDIR
 from time import time
 from disktools import read_block, write_block, BLOCK_SIZE, NUM_BLOCKS
@@ -117,7 +117,7 @@ class Small(LoggingMixIn, Operations):
 
         #no available blocks
         if block_num == -1:
-            raise FuseOSError(ENOMEM)
+            raise FuseOSError(ENOSPC)
 
         #get short file name
         path_split = path.split("/")
@@ -168,7 +168,7 @@ class Small(LoggingMixIn, Operations):
 
         #no free blocks available
         if block_num == -1:
-            raise FuseOSError(ENOMEM)
+            raise FuseOSError(ENOSPC)
 
         #get short name of dir
         path_split = path.split("/")
@@ -353,7 +353,7 @@ class Small(LoggingMixIn, Operations):
         
         #not enough space
         if len(data) > total_avail_space:
-            raise FuseOSError(ENOMEM)
+            raise FuseOSError(ENOSPC)
 
         #read in all data and add in new data at the offset
         block_data = self.read(path, block_size, 0, fh)

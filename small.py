@@ -282,7 +282,31 @@ class Small(LoggingMixIn, Operations):
         raise FuseOSError(ENOSYS)
 
     def truncate(self, path, length, fh=None):
-        raise FuseOSError(ENOSYS)
+        #get block information
+        block = get_block_from_path(path)
+        block_size = int.from_bytes(block[SIZE_START:SIZE_END], BYTEORDER)
+        block_location = int.from_bytes(block[LOCATION_START:LOCATION_END], BYTEORDER)
+        block_data = self.read(path, block_size, 0, fh)
+        new_data = block_data[:length].ljust(length, b"\x00")
+
+        #delete all data from block
+        next_block_num = int.from_bytes(block[NEXTBLOCKNUM_START:NEXTBLOCKNUM_END], BYTEORDER)
+        empty_block = bytearray([0]*BLOCK_SIZE)
+        while next_block_num != END_OF_FILE:
+            next_block = read_block(next_block_num)
+            write_block(next_block_num, empty_block)
+            clear_bit(next_block_num)
+            next_block_num = int.from_bytes(next_block[NEXTBLOCKNUM_START:NEXTBLOCKNUM_END], BYTEORDER)
+
+        #reset block data
+        block[DATA_START:DATA_END] = bytearray([0]*BLOCK_DATA_SIZE)
+        block[SIZE_START:SIZE_END] = (0).to_bytes(2, BYTEORDER)
+        block[NEXTBLOCKNUM_START:NEXTBLOCKNUM_END] = END_OF_FILE.to_bytes(1, BYTEORDER)
+        
+        #write new block with truncated data
+        write_block(block_location, block)
+        self.write(path, new_data, 0, fh)
+        self.utimens(path)
 
     def unlink(self, path):
         block = get_block_from_path(path)
@@ -329,16 +353,17 @@ class Small(LoggingMixIn, Operations):
 
         #read in all data and add in new data at the offset
         block_data = self.read(path, block_size, 0, fh)
-        new_data = block_data[:offset].ljust(offset) + data + block_data[offset + len(data):]
+        new_data = block_data[:offset].ljust(offset, b"\x00") + data + block_data[offset + len(data):]
         block[SIZE_START:SIZE_END] = len(new_data).to_bytes(2, BYTEORDER)
 
         #special case to insert data in first block
         if len(new_data) <= BLOCK_DATA_SIZE:
-            block[DATA_START:DATA_END] = new_data.ljust(BLOCK_DATA_SIZE)
+            block[DATA_START:DATA_END] = new_data.ljust(BLOCK_DATA_SIZE, b"\x00")
             new_data = b""
         else:
             block[DATA_START:DATA_END] = new_data[0:BLOCK_DATA_SIZE]
             new_data = new_data[BLOCK_DATA_SIZE:]
+        self.utimens(path)
         write_block(block_location, block)
         
         #insert remaining/leftover data in different blocks
@@ -362,7 +387,7 @@ class Small(LoggingMixIn, Operations):
             
             #insert data into the block
             current_block_num = next_block_num
-            block[OVERFLOW_DATA_START:OVERFLOW_DATA_END] = new_data[:OVERFLOW_BLOCK_DATA_SIZE].ljust(OVERFLOW_BLOCK_DATA_SIZE)
+            block[OVERFLOW_DATA_START:OVERFLOW_DATA_END] = new_data[:OVERFLOW_BLOCK_DATA_SIZE].ljust(OVERFLOW_BLOCK_DATA_SIZE, b"\x00")
             new_data = new_data[OVERFLOW_BLOCK_DATA_SIZE:]
             write_block(next_block_num, block)
         return len(data)

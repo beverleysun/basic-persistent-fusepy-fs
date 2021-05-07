@@ -21,20 +21,12 @@ def clear_bit(offset_from_left):
 
 def next_avail_block_num():
     map = read_bitmap()
-    mask = 0b1111111111111111
-    map ^= mask
-    try:
-        return 15 - int(math.log2(map))
-    except ValueError:
-        return -1
-
+    map_str = bin(read_bitmap())[2:]
+    return map_str.find("0")
+    
 def num_avail_blocks():
-    count = 0
-    map_str = str(bin(read_bitmap()))[2:]
-    for i in range(0,len(map_str)):
-        if map_str[i] == "0":
-            count += 1
-    return count
+    map_str = bin(read_bitmap())[2:]
+    return map_str.count("0")
 
 def write_map_to_file(map):
     with open(BITMAP_FILE_NAME, "w") as bitmap:
@@ -42,4 +34,4 @@ def write_map_to_file(map):
 
 def read_bitmap():
     with open(BITMAP_FILE_NAME, "r") as bitmap:
-        return int(bitmap.readline(), 2) 
+        return int(bitmap.readline(), 2)

@@ -15,13 +15,10 @@ from disktools import read_block, write_block, BLOCK_SIZE, NUM_BLOCKS
 from byte_locations import *
 from bitmap import next_avail_block_num, set_bit, clear_bit, num_avail_blocks
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
+from format import END_OF_FILE, BYTEORDER, STR_ENCODING
 
-#constants
-END_OF_FILE = 20
 BLOCK_DATA_SIZE = DATA_END - DATA_START
 OVERFLOW_BLOCK_DATA_SIZE = OVERFLOW_DATA_END - OVERFLOW_DATA_START
-BYTEORDER = "little"
-STR_ENCODING = "utf-8"
 
 if not hasattr(__builtins__, 'bytes'):
     bytes = str
@@ -42,9 +39,8 @@ def get_block_from_path(path):
         dir_block_links = dir_block[DATA_START:DATA_START+dir_block_nlinks-2] #get actual links
 
         #iterate through all files in directory
-        for j in range(0, len(dir_block_links)): 
+        for block_num in dir_block_links:
             #get file info
-            block_num = dir_block_links[j] #get file location (block number)
             block = read_block(block_num) #get file block
             block_name = block[NAME_START:NAME_END].decode(STR_ENCODING).rstrip('\x00')
             block_mode = int.from_bytes(block[MODE_START:MODE_END], BYTEORDER)
@@ -54,7 +50,8 @@ def get_block_from_path(path):
             if path_array[i] == block_name and S_ISDIR(block_mode):
                 dir_block_to_check = int.from_bytes(block[LOCATION_START:LOCATION_END], BYTEORDER)
                 break
-    #if nothing is returned by this stage, the file/dir doesn't exist
+            if block_num == dir_block_links[-1]:
+                raise FuseOSError(ENOENT)
     raise FuseOSError(ENOENT)
 
 def add_link_to_dir(dir_block, link_location):
@@ -66,24 +63,19 @@ def add_link_to_dir(dir_block, link_location):
     dir_location = int.from_bytes(dir_block[LOCATION_START:LOCATION_END], BYTEORDER)
     write_block(dir_location, dir_block)
 
-def rm_link_from_dir(path, block_num):
+def rm_link_from_dir(path, block_num_to_remove):
     #get dir info
     parent_block = get_block_from_path(path)
     parent_location = int.from_bytes(parent_block[LOCATION_START:LOCATION_END], BYTEORDER)
     parent_nlinks = int.from_bytes(parent_block[NLINKS_START:NLINKS_END], BYTEORDER)
     parent_links = parent_block[DATA_START:DATA_START+parent_nlinks-2]
 
-    #remove the link for the removed dir
-    updated_links = []
-    for i in range(0, len(parent_links)):
-        link_num = parent_links[i]
-        if link_num != block_num:
-            updated_links.append(parent_links[i])
+    #remove the link for the removed link
+    updated_links = [l for l in parent_links if l != block_num_to_remove]
     
-    #remove all links and them back, except for the removed dir
+    #remove all links and them back, except for the removed link
     parent_block[DATA_START:DATA_END] = bytearray([0]*(DATA_END-DATA_START))
-    for i in range(0, len(updated_links)):
-        parent_block[DATA_START:DATA_START+i] = updated_links[i].to_bytes(1, BYTEORDER)
+    parent_block[DATA_START:DATA_START+len(updated_links)] = updated_links
 
     parent_block[NLINKS_START:NLINKS_END] =(parent_nlinks-1).to_bytes(1, BYTEORDER)
     write_block(parent_location, parent_block) #update parent block in disk
@@ -105,6 +97,15 @@ def init_block_data(block, name, nlinks, block_num, mode):
         block[SIZE_START:SIZE_END] = BLOCK_SIZE.to_bytes(2, BYTEORDER)
     return block
 
+def remaining_space_on_file_end_block(start_block):
+    block_size = int.from_bytes(start_block[SIZE_START:SIZE_END], BYTEORDER)
+    avail_space_end_block = 0
+    if block_size <= BLOCK_DATA_SIZE:
+        avail_space_end_block = BLOCK_DATA_SIZE - block_size
+    else:
+        avail_space_end_block = OVERFLOW_BLOCK_DATA_SIZE - ((block_size - BLOCK_DATA_SIZE) % OVERFLOW_BLOCK_DATA_SIZE)
+    return avail_space_end_block
+
 class Small(LoggingMixIn, Operations):
     def chmod(self, path, mode):
         raise FuseOSError(ENOSYS)
@@ -121,7 +122,7 @@ class Small(LoggingMixIn, Operations):
 
         #get short file name
         path_split = path.split("/")
-        name = path_split[len(path_split)-1]
+        name = path_split[-1]
 
         #initialise and write block
         block = read_block(block_num)
@@ -130,7 +131,7 @@ class Small(LoggingMixIn, Operations):
         set_bit(block_num)
 
         #link it to its parent dir
-        path_to_dir = "/" + "/".join(path_split[1:len(path_split) - 1])
+        path_to_dir = "/" + "/".join(path_split[1:-1])
         dir_block = get_block_from_path(path_to_dir)
         add_link_to_dir(dir_block, block_num)
 
@@ -172,7 +173,7 @@ class Small(LoggingMixIn, Operations):
 
         #get short name of dir
         path_split = path.split("/")
-        name = path_split[len(path_split)-1]
+        name = path_split[-1]
 
         #initialise and write block
         block = read_block(block_num)
@@ -181,7 +182,7 @@ class Small(LoggingMixIn, Operations):
         set_bit(block_num)
 
         #link dir to parent dir
-        path_to_dir = "/" + "/".join(path_split[1:len(path_split) - 1])
+        path_to_dir = "/" + "/".join(path_split[1:-1])
         dir_block = get_block_from_path(path_to_dir)
         add_link_to_dir(dir_block, block_num)
 
@@ -198,50 +199,31 @@ class Small(LoggingMixIn, Operations):
             size = block_size - offset
         
         #calculate offset for the required block
-        num_blocks_for_offset = 1 #number of blocks needed to traverse to get to the offset
+        num_blocks_for_offset = 0 #number of blocks needed to traverse to get to the offset
         if offset >= BLOCK_DATA_SIZE:
             offset -= BLOCK_DATA_SIZE
-            num_blocks_for_offset += 1
-            num_blocks_for_offset += int(offset/(OVERFLOW_BLOCK_DATA_SIZE))
-            offset = offset%(OVERFLOW_BLOCK_DATA_SIZE)
-        
+            num_blocks_for_offset += 1 + int(offset/OVERFLOW_BLOCK_DATA_SIZE)
+            offset = offset % OVERFLOW_BLOCK_DATA_SIZE
+
         #find block to start reading from
-        for i in range(1, num_blocks_for_offset):
+        for _ in range(num_blocks_for_offset):
             next_block_num = int.from_bytes(block[NEXTBLOCKNUM_START:NEXTBLOCKNUM_END], BYTEORDER)
             block = read_block(next_block_num)
 
-        sizes = [] #the sizes to read from each block
+        data = b""
+        #special case to read from the first block
+        if num_blocks_for_offset == 0:
+            data += block[DATA_START+offset:DATA_END]
+        else:
+            data += block[OVERFLOW_DATA_START+offset:OVERFLOW_DATA_END]
 
-        #calculate sizes needed to read for each block
-        if num_blocks_for_offset == 1 and size > BLOCK_DATA_SIZE - offset:
-            sizes.append(BLOCK_DATA_SIZE - offset)
-            size -= BLOCK_DATA_SIZE - offset
-        elif num_blocks_for_offset > 1 and size > OVERFLOW_BLOCK_DATA_SIZE - offset:
-            sizes.append(OVERFLOW_BLOCK_DATA_SIZE - offset)
-            size -= OVERFLOW_BLOCK_DATA_SIZE - offset
-        else:
-            sizes.append(size)
-            size = 0
-        
-        while size > OVERFLOW_BLOCK_DATA_SIZE:
-            sizes.append(OVERFLOW_BLOCK_DATA_SIZE)
-            size  -= OVERFLOW_BLOCK_DATA_SIZE
-        if size > 0:
-            sizes.append(size)
-        
-        # read all required data from the block(s)
-        data = ""
-        if num_blocks_for_offset == 1:
-            data += block[DATA_START+offset:DATA_START+offset+sizes[0]].decode(STR_ENCODING)
-        else:
-            data += block[OVERFLOW_DATA_START+offset:OVERFLOW_DATA_START+offset+sizes[0]].decode(STR_ENCODING)
-        
-        for s in sizes[1:]:
+        #keep reading blocks until the data length >= the size
+        while len(data) < size:
             next_block_num = int.from_bytes(block[NEXTBLOCKNUM_START:NEXTBLOCKNUM_END], BYTEORDER)
             block = read_block(next_block_num)
-            data +=  block[OVERFLOW_DATA_START:OVERFLOW_DATA_START+s].decode(STR_ENCODING)
+            data += block[OVERFLOW_DATA_START:OVERFLOW_DATA_END]
 
-        return bytes(data, STR_ENCODING)
+        return data[0:size]
 
     def readdir(self, path, fh):
         block = get_block_from_path(path)
@@ -256,10 +238,7 @@ class Small(LoggingMixIn, Operations):
         return files
 
     def readlink(self, path):
-        block = get_block_from_path(path)
-        block_size = int.from_bytes(block[SIZE_START:SIZE_END], BYTEORDER)
-        block_data = self.read(path, block_size, 0, 0)
-        return block_data
+        raise FuseOSError(ENOSYS)
 
     def removexattr(self, path, name):
         raise FuseOSError(ENOSYS)
@@ -286,10 +265,10 @@ class Small(LoggingMixIn, Operations):
             path_split = path.split("/")
 
             #remove link from parent dir
-            parent_dir_path = "/" + "/".join(path_split[1:len(path_split)-1])
+            parent_dir_path = "/" + "/".join(path_split[1:-1])
             rm_link_from_dir(parent_dir_path, block_location)
 
-            #zero out the removed dir
+            #remove the dir
             write_block(block_location, bytearray([0]*BLOCK_SIZE))
             clear_bit(block_location)
 
@@ -339,41 +318,32 @@ class Small(LoggingMixIn, Operations):
     def write(self, path, data, offset, fh):
         block = get_block_from_path(path)
         block_location = int.from_bytes(block[LOCATION_START:LOCATION_END], BYTEORDER)
-
-        # calculate total available space
         block_size = int.from_bytes(block[SIZE_START:SIZE_END], BYTEORDER)
-        avail_space_end_block = 0
-        if block_size <= BLOCK_DATA_SIZE:
-            avail_space_end_block = BLOCK_DATA_SIZE - block_size
-        else:
-            avail_space_end_block = OVERFLOW_BLOCK_DATA_SIZE - ((block_size - (BLOCK_DATA_SIZE)) % (OVERFLOW_BLOCK_DATA_SIZE))
         
+        # calculate total available space
+        avail_space_end_block = remaining_space_on_file_end_block(block)
         free_blocks_avail_space = num_avail_blocks() * (OVERFLOW_BLOCK_DATA_SIZE)
         total_avail_space = avail_space_end_block + free_blocks_avail_space
-        
-        #not enough space
         if len(data) > total_avail_space:
             raise FuseOSError(ENOSPC)
 
         #read in all data and add in new data at the offset
         block_data = self.read(path, block_size, 0, fh)
-        new_data = block_data[0:offset].decode(STR_ENCODING) + data.decode(STR_ENCODING) + block_data[offset:].decode(STR_ENCODING)
-
-        #update size of file
+        new_data = block_data[:offset].ljust(offset) + data + block_data[offset + len(data):]
         block[SIZE_START:SIZE_END] = len(new_data).to_bytes(2, BYTEORDER)
 
-        #insert data in first block
+        #special case to insert data in first block
         if len(new_data) <= BLOCK_DATA_SIZE:
-            block[DATA_START:DATA_END] = bytes(new_data.ljust(BLOCK_DATA_SIZE, "\x00"), STR_ENCODING)
-            new_data = ""
+            block[DATA_START:DATA_END] = new_data.ljust(BLOCK_DATA_SIZE)
+            new_data = b""
         else:
-            block[DATA_START:DATA_END] = bytes(new_data[0:BLOCK_DATA_SIZE], STR_ENCODING)
+            block[DATA_START:DATA_END] = new_data[0:BLOCK_DATA_SIZE]
             new_data = new_data[BLOCK_DATA_SIZE:]
         write_block(block_location, block)
-        current_block_num = block_location
-
+        
         #insert remaining/leftover data in different blocks
-        while new_data != "":
+        current_block_num = block_location
+        while new_data != b"":
             next_block_num = int.from_bytes(block[NEXTBLOCKNUM_START:NEXTBLOCKNUM_END], BYTEORDER)
             if next_block_num == END_OF_FILE:
                 #create new block if previous block was end of file
@@ -391,17 +361,10 @@ class Small(LoggingMixIn, Operations):
                 block = read_block(next_block_num)
             
             #insert data into the block
-            if len(new_data) <= OVERFLOW_BLOCK_DATA_SIZE:
-                block[OVERFLOW_DATA_START:OVERFLOW_DATA_END] = bytes(new_data.ljust(OVERFLOW_BLOCK_DATA_SIZE, "\x00"), STR_ENCODING)
-                new_data = ""
-            else:
-                block[OVERFLOW_DATA_START:OVERFLOW_DATA_END] = bytes(new_data[0:OVERFLOW_BLOCK_DATA_SIZE], STR_ENCODING)
-                new_data = new_data[OVERFLOW_BLOCK_DATA_SIZE:]
-            write_block(next_block_num, block)
-
-            #update current block number
             current_block_num = next_block_num
-        
+            block[OVERFLOW_DATA_START:OVERFLOW_DATA_END] = new_data[:OVERFLOW_BLOCK_DATA_SIZE].ljust(OVERFLOW_BLOCK_DATA_SIZE)
+            new_data = new_data[OVERFLOW_BLOCK_DATA_SIZE:]
+            write_block(next_block_num, block)
         return len(data)
 
 if __name__ == '__main__':

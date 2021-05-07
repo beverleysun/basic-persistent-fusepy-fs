@@ -1,0 +1,5 @@
+*.pdf
+/mount
+/__pycache__
+my-disk
+bitmap
